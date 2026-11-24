@@ -1,4 +1,3 @@
-<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
 <!doctype html>
 <html lang="ja">
 <head>
@@ -1314,19 +1313,24 @@ async function cachePut(entry){
 
 // 範囲 area の道路・緑地・施設を取る。2点が違えば、2点を結ぶ線から R m 以内の帯状の範囲になる（Overpass の around は線にも使える）
 // timeoutSec はサーバー側の打ち切り時間。短いほど混んだサーバーに受け付けられやすい
-function overpassQuery(area, timeoutSec){
+function overpassQuery(area, timeoutSec, kind){
   const pts = (area.lat2 === area.lat && area.lon2 === area.lon) ? area.lat+','+area.lon : area.lat+','+area.lon+','+area.lat2+','+area.lon2;
   const a = '(around:'+area.R+','+pts+')';
+  if(kind !== 'env'){
+    // 道路だけ。軽いので数秒〜十数秒で返る。コース探索に必要な最小限のデータ
+    return '[out:json][timeout:'+timeoutSec+'];'
+      + 'way["highway"~"^(footway|path|pedestrian|cycleway|track|steps|bridleway|living_street|residential|service|unclassified|road|tertiary|tertiary_link|secondary|secondary_link|primary|primary_link|trunk|trunk_link)$"]["area"!="yes"]["service"!~"^(driveway|parking_aisle|drive-through)$"]'+a+'->.r;'
+      + '(.r; .r >;);out body qt;';
+  }
+  // 公園・緑・水辺・田畑・木・トイレなどの施設。重いので、道路のあとで取る（なくてもコースは探せる）
   return '[out:json][timeout:'+timeoutSec+'];('
-    + 'way["highway"~"^(footway|path|pedestrian|cycleway|track|steps|bridleway|living_street|residential|service|unclassified|road|tertiary|tertiary_link|secondary|secondary_link|primary|primary_link|trunk|trunk_link)$"]["area"!="yes"]["service"!~"^(driveway|parking_aisle|drive-through)$"]'+a+';'
     + 'way["leisure"~"^(park|garden|nature_reserve)$"]'+a+';'
     + 'way["landuse"~"^(forest|grass|meadow|recreation_ground|village_green|farmland|orchard|allotments|paddy|vineyard)$"]'+a+';'
     + 'way["natural"~"^(wood|scrub|grassland|wetland|water|coastline|tree_row)$"]'+a+';'
     + 'way["waterway"~"^(river|stream|canal)$"]'+a+';'
-    + 'node["natural"="tree"]'+a+';'                                                     // 街路樹など1本ずつの木（並木・木陰の判定に使う）
-    + 'relation["leisure"~"^(park|garden|nature_reserve)$"]'+a+';'                       // 公園は小さいので、範囲外の部分も含めて丸ごと取る
+    + 'node["natural"="tree"]'+a+';'
+    + 'relation["leisure"~"^(park|garden|nature_reserve)$"]'+a+';'
     + ')->.a;'
-    // 川・湖・森・田畑の関係（relation）は範囲のはるか外まで続くことがあり、丸ごと取ると重い。関係そのものと、範囲内にあるメンバーの線だけ取る
     + '(relation["natural"~"^(wood|wetland|water)$"]'+a+';'
     + 'relation["landuse"~"^(forest|grass|meadow|recreation_ground|farmland|orchard|allotments|paddy|vineyard)$"]'+a+';)->.big;'
     + 'way(r.big)'+a+'->.bw;'
@@ -1341,21 +1345,25 @@ function overpassQuery(area, timeoutSec){
 //   ・試行ごとの打ち切り時間（秒）。1回目は短め。時間切れなら同じサーバーで長めに再試行する（2回目はサーバーの処理が温まっていて速い）
 //   ・サーバーが混んでいる（429/503/504）か通信できないときは、すぐ別のサーバーに切り替える。同じサーバーで2回時間切れになっても切り替える
 //   ・同時に2つ送らない（公開サーバーは1つの端末からの同時実行を2つまでに制限していて、超えると断られる）
-const FETCH_PLAN = [45, 90, 150, 150];
+const ROADS_PLAN = [30, 50, 80, 80];     // 道路だけの取得。軽いので短めに切って、早めに別のサーバーへ
+const ENV_PLAN = [60, 120];              // 公園・水辺などの後追い取得。失敗してもコース探索はできる
 let sleep = ms => new Promise(r => setTimeout(r, ms));
 // rec.say(msg) で進み具合を画面に出す。失敗したときは err.kind に 'busy' / 'timeout' / 'network' / 'empty' / 'other' を入れて投げる
-async function fetchOsm(area, rec){
+async function fetchOsm(area, rec, kind, ext){
+  const PLAN = kind === 'env' ? ENV_PLAN : ROADS_PLAN, label = kind === 'env' ? '公園・水辺' : '道路';
   let server = 0, slowOnSame = 0, lastErr = null;
-  for(let attempt = 0; attempt < FETCH_PLAN.length; attempt++){
-    const timeoutSec = FETCH_PLAN[attempt], url = ENDPOINTS[server], t0 = Date.now();
+  for(let attempt = 0; attempt < PLAN.length; attempt++){
+    if(ext && ext.signal.aborted) throw Object.assign(new Error('cancel'), {kind:'cancel'});
+    const timeoutSec = PLAN[attempt], url = ENDPOINTS[server], t0 = Date.now();
     const ctl = new AbortController();
-    const kill = setTimeout(() => ctl.abort(), (timeoutSec + 45)*1000);                  // サーバー側の打ち切りより、受信の時間ぶん長く待つ
-    const tick = setInterval(() => rec.say(rec.where+'の道路データを取得しています…（'+(attempt+1)+'回目、'+Math.round((Date.now()-t0)/1000)+'秒）'
-      + (attempt ? '' : ' 初回は時間がかかります。次回からは保存したデータを使います')), 1000);
-    rec.say(rec.where+'の道路データを取得しています…（'+(attempt+1)+'回目）');
-    let kind = 'other', wait = 2000;
+    const onExt = () => ctl.abort(); if(ext) ext.signal.addEventListener('abort', onExt);
+    const kill = setTimeout(() => ctl.abort(), (timeoutSec + 30)*1000);                  // サーバー側の打ち切りより、受信の時間ぶん長く待つ
+    const tick = setInterval(() => rec.say(rec.where+'の'+label+'データを取得しています…（'+(attempt+1)+'回目、'+Math.round((Date.now()-t0)/1000)+'秒）'
+      + (attempt ? '' : ' 初回だけ時間がかかります。次回からは保存したデータを使います')), 1000);
+    rec.say(rec.where+'の'+label+'データを取得しています…（'+(attempt+1)+'回目）');
+    let kind2 = 'other', wait = 2000;
     try{
-      const r = await fetch(url, {method:'POST', body:'data='+encodeURIComponent(overpassQuery(area, timeoutSec)),
+      const r = await fetch(url, {method:'POST', body:'data='+encodeURIComponent(overpassQuery(area, timeoutSec, kind)),
         headers:{'Content-Type':'application/x-www-form-urlencoded'}, signal:ctl.signal});
       if(r.status === 429 || r.status === 503 || r.status === 504) throw Object.assign(new Error('HTTP '+r.status), {kind:'busy'});
       if(!r.ok) throw Object.assign(new Error('HTTP '+r.status), {kind:'other', fatal:true});   // 400 などはクエリの問題なので試し直しても同じ
@@ -1363,8 +1371,9 @@ async function fetchOsm(area, rec){
       const text = await r.text();
       const tBody = Date.now()-t0;                                                       // 診断：本体を受け取り終えるまで
       const json = JSON.parse(text);
+      if(kind === 'env' && !json.remark && json.elements) return {json, text};             // 公園などが1つもない範囲もある
       if(json.elements && json.elements.length){
-        dlog('　└ '+(attempt+1)+'回目 成功', tBody, new URL(url).host+'｜応答開始 '+(tHead/1000).toFixed(1)+'秒・受信完了 '+(tBody/1000).toFixed(1)+'秒｜'+(text.length/1048576).toFixed(1)+'MB');
+        dlog('　└ '+label+' '+(attempt+1)+'回目 成功', tBody, new URL(url).host+'｜応答開始 '+(tHead/1000).toFixed(1)+'秒・受信完了 '+(tBody/1000).toFixed(1)+'秒｜'+(text.length/1048576).toFixed(1)+'MB');
         return {json, text};
       }
       if(json.remark && /timed out/i.test(json.remark)) throw Object.assign(new Error(json.remark), {kind:'timeout'});
@@ -1372,28 +1381,29 @@ async function fetchOsm(area, rec){
       throw Object.assign(new Error('empty'), {kind:'empty', fatal:true});                 // 本当に何もない範囲
     }catch(err){
       clearTimeout(kill); clearInterval(tick);
-      if(err.name === 'AbortError') kind = 'timeout';
-      else if(err.kind) kind = err.kind;
-      else if(err instanceof TypeError) kind = 'network';                                   // 通信できない・CORSで読めない応答
-      lastErr = Object.assign(err, {kind});
-      dlog('　└ '+(attempt+1)+'回目 失敗', Date.now()-t0, new URL(url).host+'｜'+({busy:'混雑・制限', timeout:'時間切れ', network:'通信エラー', empty:'データなし', other:'その他'}[kind] || kind)+'（'+(err.message || '')+'）');
+      if(ext && ext.signal.aborted) throw Object.assign(err, {kind:'cancel'});               // 別の範囲を優先するため中止された
+      if(err.name === 'AbortError') kind2 = 'timeout';
+      else if(err.kind) kind2 = err.kind;
+      else if(err instanceof TypeError) kind2 = 'network';                                   // 通信できない・CORSで読めない応答
+      lastErr = Object.assign(err, {kind:kind2});
+      dlog('　└ '+label+' '+(attempt+1)+'回目 失敗', Date.now()-t0, new URL(url).host+'｜'+({busy:'混雑・制限', timeout:'時間切れ', network:'通信エラー', empty:'データなし', other:'その他'}[kind2] || kind2)+'（'+(err.message || '')+'）');
       if(err.fatal) break;
-      if(kind === 'timeout' && ++slowOnSame < 2){ wait = 3000; }                           // 遅いだけなら同じサーバーで長めにもう一度
-      else { server = (server + 1) % ENDPOINTS.length; slowOnSame = 0; wait = kind === 'busy' ? 8000 : 3000; }
-      if(attempt + 1 < FETCH_PLAN.length){
-        const why = kind === 'busy' ? 'サーバーが混んでいます' : kind === 'timeout' ? '時間切れでした' : '通信に失敗しました';
+      if(kind2 === 'timeout' && ++slowOnSame < 2){ wait = 3000; }                           // 遅いだけなら同じサーバーで長めにもう一度
+      else { server = (server + 1) % ENDPOINTS.length; slowOnSame = 0; wait = kind2 === 'busy' ? 5000 : 2000; }
+      if(attempt + 1 < PLAN.length){
+        const why = kind2 === 'busy' ? 'サーバーが混んでいます' : kind2 === 'timeout' ? '時間切れでした' : '通信に失敗しました';
         rec.say(why+'。'+Math.round(wait/1000)+'秒待って、もう一度試します…（'+(attempt+2)+'回目）');
         await sleep(wait);
       }
       continue;
-    }finally{ clearTimeout(kill); clearInterval(tick); }
+    }finally{ clearTimeout(kill); clearInterval(tick); if(ext) ext.signal.removeEventListener('abort', onExt); }
   }
   throw lastErr || Object.assign(new Error('fetch failed'), {kind:'other'});
 }
 // 取得に失敗したときの案内
 function fetchFailText(e){
   const k = e && e.kind;
-  if(k === 'busy' || k === 'timeout') return '道路データのサーバーが混んでいて取得できませんでした（'+FETCH_PLAN.length+'回試しました）。少し待ってからもう一度お試しください。';
+  if(k === 'busy' || k === 'timeout') return '道路データのサーバーが混んでいて取得できませんでした（'+ROADS_PLAN.length+'回試しました）。少し待ってからもう一度お試しください。';
   if(k === 'empty') return 'この範囲には道路データがありませんでした。出発地の位置を確認してください。';
   return '道路データを取得できませんでした。通信状況を確認して、もう一度お試しください。';
 }
@@ -1416,6 +1426,40 @@ function covers(c, need){
   return true;
 }
 
+const cacheId = a => [a.lat.toFixed(5), a.lon.toFixed(5), a.lat2.toFixed(5), a.lon2.toFixed(5), a.R].join(',');
+const needsEnv = () => !!(S.greenPref || S.shadePref || S.farmPref);   // 緑・木陰・田畑の好みを選んでいるときだけ、公園などのデータを待つ
+// 公園・水辺・施設を裏で取り、届いたら道路データに足す。失敗してもコース探索はできる
+function startEnv(base, a){
+  const job = {ctl:new AbortController()};
+  S.envJob = job;
+  const rec = {where:'周辺', say:() => {}};
+  const t0 = performance.now();
+  S.envP = (async () => {
+    try{
+      const {json, text} = await fetchOsm(a, rec, 'env', job.ctl);
+      if(S.osm !== base) return;                                          // 取っている間に別の範囲へ切り替わった
+      base.elements = base.elements.concat(json.elements);
+      resetGraph();
+      dlog('公園・水辺・施設の追加取得', performance.now()-t0, (text.length/1048576).toFixed(1)+'MB・要素'+json.elements.length+'個を追加', true);
+      cachePut({id:cacheId(a), v:DATA_VER, lat:a.lat, lon:a.lon, lat2:a.lat2, lon2:a.lon2, R:a.R, t:Date.now(), text:JSON.stringify(base), envDone:true});
+      if(!busy){
+        if(S.routes && S.routes.length) setStatus('公園・水辺・トイレなどの情報を追加しました。もう一度探すと、コースに反映されます。');
+        await tick(); if(!S.G && S.osm === base && S.home && !busy) S.G = buildGraphTimed('（追加後）');
+      }
+    }catch(err){
+      if(!(err && err.kind === 'cancel')) dlog('公園・水辺・施設の追加取得 失敗（道路だけで探します）', performance.now()-t0, (err && err.message) || '');
+    }finally{ if(S.envJob === job) S.envJob = null; }
+  })();
+}
+// 緑の道などを優先する設定のときだけ、公園などのデータが届くのを待つ
+async function waitEnvIfNeeded(){
+  if(!needsEnv() || !S.envP) return;
+  const t = performance.now();
+  setStatus('公園・水辺などの情報を取得しています…（「緑・木陰・田畑」の設定を使うため待っています）');
+  await S.envP.catch(() => {});
+  dlog('① + 公園・水辺の待ち時間（優先設定ありのとき）', performance.now()-t, '', true);
+}
+
 // 範囲 area の道路データを用意する。手持ち → 保存データ（IndexedDB）→ サーバー、の順。quiet なら画面に経過を出さない
 async function ensureOsm(area, quiet){
   if(S.osm && covers(S.osmArea, area)) return S.osm;
@@ -1425,6 +1469,7 @@ async function ensureOsm(area, quiet){
     await S.inflight.p.catch(() => {});                                                           // 同時に2つ送らず、順番に
     return ensureOsm(area, quiet);
   }
+  if(S.envJob){ S.envJob.ctl.abort(); S.envJob = null; }                 // 後追いの取得は、別の範囲の道路取得を優先してやめる
   const band = area.lat2 !== area.lat || area.lon2 !== area.lon;        // 出発地と行き先を結ぶ帯状の範囲
   const rec = {lat:area.lat, lon:area.lon, lat2:area.lat2, lon2:area.lon2, R:area.R, verbose:!quiet, p:null,
     where: band ? (area.name || '出発地から行き先まで') : '周辺'};
@@ -1440,15 +1485,17 @@ async function ensureOsm(area, quiet){
         const tp = performance.now();
         const j = JSON.parse(e.text);
         dlog('保存データ読込（JSON解析）', performance.now()-tp, (e.text.length/1048576).toFixed(1)+'MB・要素'+j.elements.length+'個'+(quiet ? '（先読み）' : ''));
-        S.osm = j; S.osmArea = {lat:e.lat, lon:e.lon, lat2:e.lat2, lon2:e.lon2, R:e.R}; resetGraph(); return j;
+        S.osm = j; S.osmArea = {lat:e.lat, lon:e.lon, lat2:e.lat2, lon2:e.lon2, R:e.R}; resetGraph(); S.envP = null;
+        if(e.envDone === false) startEnv(j, S.osmArea);                  // 前回は道路だけで終わっていた。公園などの続きを取る
+        return j;
       }
     }
     const tf = performance.now();
-    const {json, text} = await fetchOsm(area, rec);
+    const {json, text} = await fetchOsm(area, rec, 'roads');
     dlog('道路データ取得（サーバー）合計', performance.now()-tf, (text.length/1048576).toFixed(1)+'MB・要素'+json.elements.length+'個・半径'+area.R+'m'+(quiet ? '（先読み）' : ''), true);
-    S.osm = json; S.osmArea = {lat:area.lat, lon:area.lon, lat2:area.lat2, lon2:area.lon2, R:area.R}; resetGraph();
-    cachePut({id:[area.lat.toFixed(5), area.lon.toFixed(5), area.lat2.toFixed(5), area.lon2.toFixed(5), area.R].join(','), v:DATA_VER,
-      lat:area.lat, lon:area.lon, lat2:area.lat2, lon2:area.lon2, R:area.R, t:Date.now(), text});
+    S.osm = json; S.osmArea = {lat:area.lat, lon:area.lon, lat2:area.lat2, lon2:area.lon2, R:area.R}; resetGraph(); S.envP = null;
+    cachePut({id:cacheId(area), v:DATA_VER, lat:area.lat, lon:area.lon, lat2:area.lat2, lon2:area.lon2, R:area.R, t:Date.now(), text, envDone:false});
+    startEnv(json, S.osmArea);                                            // 道路が届いたら、すぐ探せる。公園などは裏で取る
     return json;
   })();
   S.inflight = rec;
@@ -1486,6 +1533,7 @@ async function search(alt){
     const tData = performance.now();
     const hadData = !!(S.osm && covers(S.osmArea, {lat:S.home.lat, lon:S.home.lon, lat2:S.home.lat, lon2:S.home.lon, R:bucketR(L)}));
     await ensureOsm({lat:S.home.lat, lon:S.home.lon, lat2:S.home.lat, lon2:S.home.lon, R:bucketR(L)}, false);
+    await waitEnvIfNeeded();
     const dData = performance.now()-tData;
     dlog('① 道路データの用意（手持ち・保存・サーバーのどれか）', dData, hadData ? 'すでに読み込み済み（先読みが間に合った）' : '検索ボタンの後に待った時間', true);
     const tGraph = performance.now();
@@ -1569,6 +1617,7 @@ $('destMode').addEventListener('click', e => {
 async function prepareGraph(to, name){
   setStatus('道路データを確認しています…');
   await ensureOsm({lat:S.home.lat, lon:S.home.lon, lat2:to.lat, lon2:to.lon, R:CORRIDOR_W, name}, false);
+  await waitEnvIfNeeded();
   if(!S.G){ setStatus('道路データを整理しています…'); await tick(); S.G = buildGraphTimed(); }
   const G = S.G;
   if(G.homeNode < 0 || G.compNodes.length < 50 || G.homeDist > 600) throw new Error('NOROAD');
@@ -2050,5 +2099,3 @@ if(S.home){ setHome(S.home.lat, S.home.lon, S.home.label === '現在地' ? '前�
 </script>
 </body>
 </html>
-
-</body></html>
